@@ -8,9 +8,17 @@ EmulationStation sees these as the real sysfs card-reader files.
 
 Architecture:
   ACR122U USB -> daemon Python -> /tmp/fake-card-reader/ -> mount --bind -> ES
+
+BUGFIX (v2): EmulationStation writes to the 'association' file in APPEND
+mode (O_APPEND). Each new association made by the user was concatenated
+to the previous value instead of replacing it, corrupting the file and
+associations.json. The daemon now tracks what it wrote itself and
+extracts only the NEW part that ES appended, even if ES appended
+multiple entries in rapid succession.
 """
 
 import os
+import re
 import time
 import json
 import signal
@@ -22,6 +30,11 @@ CONFIG_FILE = "/recalbox/share/system/nfc-daemon/config.json"
 ACR_VID = 0x072f
 ACR_PID = 0x2200
 
+# Regex pour détecter un UUID format 8-4-4-4-12 hex suivi de ||
+UUID_HEADER_RE = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\|\|'
+)
+
 
 class ACRDaemon:
     def __init__(self):
@@ -32,6 +45,11 @@ class ACRDaemon:
         self.handle = None
         self.ctx = None
         self.buzzer = False
+
+        # BUGFIX: mémoire de la dernière valeur écrite dans "association".
+        # Sert à distinguer ce que le daemon a écrit lui-même de ce que ES
+        # a appendé derrière en mode O_APPEND.
+        self._last_written_assoc = ""
 
         os.makedirs(FAKE_DIR, exist_ok=True)
         self.load_associations()
@@ -100,51 +118,100 @@ class ACRDaemon:
         for name, value in writes.items():
             with open(os.path.join(FAKE_DIR, name), 'w') as f:
                 f.write(value)
+        # BUGFIX: mémoriser ce qu'on vient d'écrire dans "association"
+        self._last_written_assoc = assoc
+
+    @staticmethod
+    def _extract_last_assoc(text):
+        """Si text contient plusieurs entrées 'UUID||path' concaténées,
+        retourne la dernière. Sinon retourne text tel quel."""
+        matches = list(UUID_HEADER_RE.finditer(text))
+        if len(matches) > 1:
+            return text[matches[-1].start():]
+        return text
 
     def check_association_write(self):
-        """Check if ES wrote a new association"""
-        try:
-            with open(os.path.join(FAKE_DIR, "association"), 'r') as f:
-                new_assoc = f.read().strip()
-            if new_assoc and self.plugged:
-                uid_str = str(self.uuid)
-                if self.associations.get(uid_str) != new_assoc:
-                    self.associations[uid_str] = new_assoc
-                    self.save_associations()
-                    print(f"[ACR] Association: UID={uid_str} -> {new_assoc}")
-        except:
-            pass
+        """Check if ES wrote a new association.
 
+        ES ouvre le fichier 'association' en mode O_APPEND, donc chaque
+        écriture est AJOUTÉE au contenu existant au lieu de le remplacer.
+        On compare ce qu'on lit à ce qu'on a écrit soi-même pour isoler
+        uniquement la partie ajoutée par ES.
+        """
         try:
-            with open(os.path.join(FAKE_DIR, "reset_card"), 'r') as f:
+            path = os.path.join(FAKE_DIR, "association")
+            with open(path, 'r') as f:
+                raw = f.read()
+
+            if not self.plugged:
+                return
+
+            # Déterminer ce qu'ES a ajouté par-dessus ce que le daemon a écrit
+            prefix = self._last_written_assoc
+            if raw.startswith(prefix) and len(raw) > len(prefix):
+                new_part = raw[len(prefix):].strip()
+            elif raw == prefix:
+                # Rien de nouveau, juste ce qu'on a écrit
+                return
+            else:
+                # Contenu inattendu (race ou état incohérent)
+                # → fallback : extraire la dernière entrée UUID du tout
+                new_part = self._extract_last_assoc(raw).strip()
+
+            if not new_part:
+                return
+
+            # Si la nouvelle partie contient elle-même plusieurs entrées
+            # (ES a fait plusieurs append rapidement), garder la dernière
+            new_assoc = self._extract_last_assoc(new_part).strip()
+            if not new_assoc:
+                return
+
+            uid_str = str(self.uuid)
+            if self.associations.get(uid_str) != new_assoc:
+                self.associations[uid_str] = new_assoc
+                self.save_associations()
+                print(f"[ACR] Association: UID={uid_str} -> {new_assoc}")
+
+                # Nettoyer le fichier : garder uniquement la nouvelle assoc
+                # → empêche toute concaténation future de s'amplifier
+                with open(path, 'w') as f:
+                    f.write(new_assoc)
+                self._last_written_assoc = new_assoc
+        except Exception as e:
+            print(f"[ACR] assoc check error: {e}")
+
+        # === Reset card (inchangé) ===
+        try:
+            path = os.path.join(FAKE_DIR, "reset_card")
+            with open(path, 'r') as f:
                 content = f.read().strip()
-            if content and content != "0" and content != "":
+            if content and content not in ("0", ""):
                 uid_str = str(self.uuid)
                 if uid_str in self.associations:
                     del self.associations[uid_str]
                     self.save_associations()
                     print(f"[ACR] Reset association for UID={uid_str}")
-                with open(os.path.join(FAKE_DIR, "reset_card"), 'w') as f:
+                with open(path, 'w') as f:
                     f.write("")
+                # Après reset, invalider le prefix mémorisé
+                self._last_written_assoc = ""
         except:
             pass
 
     def led_command(self, state, buzz=False):
-        """Send LED/buzzer command to ACR122U
-        state: 'green' = card detected, 'red' = no card/idle
-        """
+        """LED/buzzer: 'green' = card detected, 'red' = no card/idle"""
         try:
             if state == 'green':
                 self.send_apdu([0xFF, 0x00, 0x40, 0x0E, 0x04,
-                               0x02, 0x01, 0x01, 0x01 if buzz else 0x00])
+                                0x02, 0x01, 0x01, 0x01 if buzz else 0x00])
             elif state == 'red':
                 self.send_apdu([0xFF, 0x00, 0x40, 0x0D, 0x04,
-                               0x00, 0x00, 0x00, 0x00])
+                                0x00, 0x00, 0x00, 0x00])
         except:
             pass
 
     def connect_acr(self):
-        """Connect to ACR122U"""
         try:
             if self.ctx:
                 try:
@@ -191,11 +258,11 @@ class ACRDaemon:
                         for i in range(min(4, len(uid_bytes))):
                             uid |= uid_bytes[i] << (i * 8)
                         self.send_apdu([0xFF, 0x00, 0x00, 0x00, 0x03,
-                                       0xD4, 0x52, 0x00])
+                                        0xD4, 0x52, 0x00])
                         return uid
             try:
                 self.send_apdu([0xFF, 0x00, 0x00, 0x00, 0x03,
-                               0xD4, 0x52, 0x00])
+                                0xD4, 0x52, 0x00])
             except:
                 pass
             return 0
